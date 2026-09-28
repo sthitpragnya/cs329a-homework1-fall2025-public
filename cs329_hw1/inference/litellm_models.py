@@ -2,7 +2,8 @@ import os
 import threading
 import time
 from typing import List, Dict, Union
-from litellm import completion
+import litellm
+from litellm import completion, stream_chunk_builder
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -10,6 +11,27 @@ from tenacity import (
 )
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Silence LiteLLM's "Provider List: ..." / "Give Feedback" banners on errors.
+litellm.suppress_debug_info = True
+
+# Per-model overrides for request parameters.
+MODEL_PARAM_OVERRIDES = {
+    # gpt-oss reasons before answering and its reasoning counts toward max_tokens,
+    # so we use low effort and a larger budget to avoid empty (truncated) answers.
+    "azure_ai/gpt-oss-120b": {
+        "reasoning_effort": "low",
+        "max_tokens": 8192,
+        # LiteLLM rejects reasoning_effort for azure_ai/ unless explicitly allowed.
+        "allowed_openai_params": ["reasoning_effort"],
+    },
+    # Non-thinking mode, closest to the original Qwen3-Next Instruct setup.
+    # It reasons in the visible answer instead, which often exceeds 4096 tokens.
+    "azure_ai/DeepSeek-V4-Flash-0731": {
+        "extra_body": {"thinking": {"type": "disabled"}},
+        "max_tokens": 8192,
+    },
+}
 
 
 class LiteLLMModel:
@@ -48,7 +70,7 @@ class LiteLLMModel:
         self.lock = threading.Lock()
         self.max_workers = max_workers
 
-    @retry(wait=wait_random_exponential(min=1, max=10), stop=stop_after_attempt(3))
+    @retry(wait=wait_random_exponential(min=5, max=10), stop=stop_after_attempt(3))
     def _make_completion_request(self, messages: List[Dict[str, str]]) -> str:
         """
         Makes a completion request with retry logic.
@@ -59,12 +81,21 @@ class LiteLLMModel:
         Returns:
             str: The response from the model.
         """
+        params = {
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            **MODEL_PARAM_OVERRIDES.get(self.model, {}),
+        }
         response = completion(
             model=self.model,
             messages=messages,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
+            # Some providers (e.g. Together's Qwen3.8-Flash) only support streaming.
+            stream=True,
+            stream_options={"include_usage": True},
+            **params,
         )
+        # Reassemble the streamed chunks into a single response.
+        response = stream_chunk_builder(list(response))
         return response["choices"][0]["message"]["content"]
 
     def send_request(self, prompt: str) -> str:
